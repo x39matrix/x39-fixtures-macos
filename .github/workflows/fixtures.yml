@@ -1,0 +1,72 @@
+name: macOS ZIP fixtures
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fixtures:
+    runs-on: macos-latest
+    steps:
+      - name: Resolve and download bundle-v1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api repos/x39matrix/x39-Evidencia/releases/tags/bundle-v1 > release.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          assets = [a for a in json.loads(Path('release.json').read_text())['assets'] if a['name'].endswith('.zip')]
+          if len(assets) != 1:
+              raise SystemExit(f'Expected exactly one ZIP asset, found {len(assets)}')
+          Path('asset-url.txt').write_text(assets[0]['browser_download_url'])
+          print(assets[0]['browser_download_url'])
+          PY
+          curl --fail --location --retry 3 "$(cat asset-url.txt)" -o bundle.zip
+      - name: Extract and add real macOS extended attributes
+        run: |
+          set -euo pipefail
+          mkdir payload zips
+          ditto -x -k bundle.zip payload
+          python3 - <<'PY'
+          import subprocess
+          from pathlib import Path
+          files = [p for p in Path('payload').rglob('*') if p.is_file() and not p.is_symlink()]
+          if not files:
+              raise SystemExit('The bundle contains no files')
+          for path in files:
+              subprocess.run(['xattr', '-w', 'com.apple.metadata:kMDItemComment', 'macOS fixture bundle-v1', str(path)], check=True)
+              subprocess.run(['xattr', '-w', 'com.x39matrix.fixture', 'Generated on a real macOS GitHub Actions runner', str(path)], check=True)
+          print(f'Added extended attributes to {len(files)} files')
+          PY
+      - name: Generate four macOS ZIP variants
+        run: |
+          set -euo pipefail
+          unset COPYFILE_DISABLE
+          ditto -c -k --sequesterRsrc --keepParent payload zips/ditto-with-parent.zip
+          ditto -c -k --sequesterRsrc payload zips/ditto-without-parent.zip
+          zip -r zips/zip-with-parent.zip payload
+          (cd payload && zip -r ../zips/zip-without-parent.zip .)
+      - name: Inspect archive metadata without running the verifier
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+          count = 0
+          for path in sorted(Path('zips').glob('*.zip')):
+              with ZipFile(path) as archive:
+                  entries = [n for n in archive.namelist() if '__MACOSX' in n.split('/')[:-1] and n.split('/')[-1].startswith('._') and not n.endswith('/')]
+              count += bool(entries)
+              print(f'{path.name}: {path.stat().st_size} bytes; {len(entries)} AppleDouble entries in __MACOSX')
+          if count == 0:
+              raise SystemExit('No archive contains AppleDouble metadata in __MACOSX')
+          print(f'{count}/4 archives contain __MACOSX with ._ files')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-zips
+          path: zips/*.zip
+          if-no-files-found: error
